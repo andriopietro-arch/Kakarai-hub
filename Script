@@ -1,4 +1,4 @@
--- KAKARAI HUB v4.1
+-- KAKARAI HUB v4.2
 local Players=game:GetService("Players")
 local RunService=game:GetService("RunService")
 local UIS=game:GetService("UserInputService")
@@ -18,12 +18,14 @@ track(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function() Cam
 local S={
  G={Team=false,MaxDist=2000},
  Aim={On=false,Hold=false,FOV=160,Smooth=0.2,Part="Cabeça",ShowFOV=true,Wall=false,Pred=0,Sticky=true,Bots=false,MaxDist=1000,Trig=false,Selected=nil},
+ Rec={On=true,Auto=true,Comp=1,Fixed=0,MaxDeg=6,Drop=0},
  ESP={On=false,Box="Canto",Names=true,Dist=true,HP=true,Tracer=false,TracerFrom="Baixo",Head=false,Skel=false,Chams=false,VisCol=false,Bots=false},
  HB={On=false,Size=12,Part="Raiz",Show=true,Transp=0.6,Bots=false},
  Mv={Speed=false,SpeedVal=40,Fly=false,FlyVal=60,Noclip=false,InfJump=false,Jump=false,JumpVal=80,Bhop=false},
  Vis={FOV=false,FOVVal=90,Full=false,NoFog=false,Cross=false},
  Misc={AFK=true,FPS=false},
- FPS={Cap="Ilimitado"},
+ FPS={Cap="Ilimitado",ESPRate="Máx"},
+ UI={Scale=1},
 }
 
 -- ===== helpers =====
@@ -81,6 +83,68 @@ local function visible(part,char)
  return workspace:Raycast(o,part.Position-o,pr)==nil
 end
 
+-- ===== RECUO (detecção + compensação) =====
+local Rec={tc={},tool=nil,name="Nenhuma",est=0,peak={},det=false,held=false,mouse=false,firingUntil=0,userMag=0,lastPitch=nil}
+local function curPitch() return math.deg(math.asin(math.clamp(Cam.CFrame.LookVector.Y,-1,1))) end
+local function isFiring() return Rec.held or Rec.mouse or os.clock()<Rec.firingUntil end
+
+local function clearTool()
+ for _,c in ipairs(Rec.tc) do pcall(function() c:Disconnect() end) end
+ Rec.tc={} Rec.tool=nil Rec.name="Nenhuma" Rec.est=0 Rec.held=false
+ Rec.det=(Rec.peak["Nenhuma"] or 0)>0.3
+end
+local function bindTool(t)
+ clearTool()
+ Rec.tool=t Rec.name=t.Name
+ Rec.det=(Rec.peak[t.Name] or 0)>0.3
+ Rec.tc[#Rec.tc+1]=t.Activated:Connect(function() Rec.held=true Rec.firingUntil=os.clock()+0.35 end)
+ Rec.tc[#Rec.tc+1]=t.Deactivated:Connect(function() Rec.held=false end)
+ Rec.tc[#Rec.tc+1]=t.Unequipped:Connect(function() if Rec.tool==t then clearTool() end end)
+end
+local function watchChar(c)
+ track(c.ChildAdded:Connect(function(ch) if ch:IsA("Tool") then bindTool(ch) end end))
+ track(c.ChildRemoved:Connect(function(ch) if ch==Rec.tool then clearTool() end end))
+ local t=c:FindFirstChildOfClass("Tool")
+ if t then bindTool(t) end
+end
+if LP.Character then watchChar(LP.Character) end
+track(LP.CharacterAdded:Connect(function(c) clearTool() watchChar(c) end))
+track(UIS.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then Rec.mouse=true end end))
+track(UIS.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then Rec.mouse=false end end))
+track(UIS.InputChanged:Connect(function(i,gpe)
+ if gpe then return end
+ if i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch then
+  Rec.userMag=Rec.userMag+math.abs(i.Delta.X)+math.abs(i.Delta.Y)
+ end
+end))
+
+local function recoilStep(dt)
+ local p=curPitch()
+ local firing=isFiring()
+ if Rec.lastPitch then
+  local d=p-Rec.lastPitch
+  if firing and Rec.userMag<1.5 and d>0.02 and d<10 then
+   Rec.est=math.min(Rec.est+d,15)
+   if Rec.est>(Rec.peak[Rec.name] or 0) then Rec.peak[Rec.name]=Rec.est end
+   if (Rec.peak[Rec.name] or 0)>0.3 then Rec.det=true end
+  end
+ end
+ Rec.userMag=0
+ Rec.est=Rec.est*math.exp(-dt*(firing and 1.5 or 5))
+end
+local function recoilDrop(dist)
+ local R=S.Rec
+ if not R.On then return 0 end
+ local deg=R.Fixed
+ if (not R.Auto) or Rec.det then
+  local base=Rec.est
+  if isFiring() then base=math.max(base,(Rec.peak[Rec.name] or 0)*0.6) end
+  deg=deg+base*R.Comp
+ end
+ deg=math.clamp(deg,0,R.MaxDeg)
+ return dist*math.tan(math.rad(deg))+(dist/100)*R.Drop
+end
+
 -- ===== AIMBOT =====
 local currentChar
 local function aimPart(e,mode,center)
@@ -135,6 +199,8 @@ local function doAim()
  if not part then currentChar=nil return end
  currentChar=e.char
  local pos=part.Position+(e.root.AssemblyLinearVelocity*S.Aim.Pred)
+ local dist=(part.Position-Cam.CFrame.Position).Magnitude
+ pos=pos-Vector3.new(0,recoilDrop(dist),0)
  local goal=CFrame.lookAt(Cam.CFrame.Position,pos)
  Cam.CFrame=Cam.CFrame:Lerp(goal,math.clamp(S.Aim.Smooth,0.01,1))
  if S.Aim.Trig and mouse1click and d<14 and os.clock()-lastClick>0.12 then
@@ -414,27 +480,36 @@ local function tpToTarget()
  end
 end
 
--- FPS
+-- ===== FPS BOOST (motor) =====
 local FS={}
 local function fpsApply(tag,on,roots,classes,prop,val)
- FS[tag]=FS[tag] or {}
+ local st=FS[tag]
+ if not st then st={prop=prop,vals={}} FS[tag]=st end
  if on then
   for _,rt in ipairs(roots) do
    for _,v in ipairs(rt:GetDescendants()) do
     for _,c in ipairs(classes) do
-     if v:IsA(c) then pcall(function() if FS[tag][v]==nil then FS[tag][v]=v[prop] end v[prop]=val end) break end
+     if v:IsA(c) then pcall(function() if st.vals[v]==nil then st.vals[v]=v[prop] end v[prop]=val end) break end
     end
    end
   end
  else
-  for v,o in pairs(FS[tag]) do pcall(function() if v.Parent then v[prop]=o end end) end
-  FS[tag]={}
+  for v,o in pairs(st.vals) do pcall(function() if v.Parent then v[prop]=o end end) end
+  st.vals={}
  end
 end
 local PART={"ParticleEmitter","Trail","Smoke","Fire","Sparkles","Beam"}
 local FX={"BloomEffect","BlurEffect","ColorCorrectionEffect","SunRaysEffect","DepthOfFieldEffect"}
-local shadowOrig
+local shadowOrig,waterSave
 local function setCap(v) pcall(function() if setfpscap then setfpscap(v=="Ilimitado" and 0 or tonumber(v)) end end) end
+local fpsFlags={Shadow=false,CastSh=false,Part=false,FX=false,Decal=false,Light=false,Refl=false,Plastic=false,Water=false,Sky=false,Low=false,Mesh=false,Sound=false}
+track(workspace.DescendantAdded:Connect(function(d)
+ if fpsFlags.Part then
+  for _,c in ipairs(PART) do if d:IsA(c) then pcall(function() d.Enabled=false end) return end end
+ end
+ if fpsFlags.CastSh and d:IsA("BasePart") then pcall(function() d.CastShadow=false end) end
+end))
+local ESPR={["Máx"]=0,["60"]=1/60,["30"]=1/30,["15"]=1/15}
 
 -- ===== UI =====
 local function new(class,props,parent)
@@ -454,11 +529,13 @@ GuiRoot=Root
 local FB=new("TextButton",{Size=UDim2.new(0,56,0,56),Position=UDim2.new(0,12,0,120),BackgroundColor3=RED,Text="KH",TextColor3=Color3.new(1,1,1),TextSize=16,Font=Enum.Font.GothamBold,BorderSizePixel=0,ZIndex=50},Root)
 corner(FB,16)
 local VP=Cam.ViewportSize
-local Win=new("Frame",{Size=UDim2.new(0,math.clamp(VP.X-100,260,360),0,math.clamp(VP.Y-90,260,520)),Position=UDim2.new(0,80,0,50),BackgroundColor3=Color3.fromRGB(12,12,17),BorderSizePixel=0,Visible=false,ClipsDescendants=true},Root)
+local defW,defH=math.clamp(VP.X-100,260,360),math.clamp(VP.Y-90,260,520)
+local Win=new("Frame",{Size=UDim2.new(0,defW,0,defH),Position=UDim2.new(0,80,0,50),BackgroundColor3=Color3.fromRGB(12,12,17),BorderSizePixel=0,Visible=false,ClipsDescendants=true},Root)
 corner(Win,13)
 new("UIStroke",{Color=RED,Thickness=1.5},Win)
+local uiScale=new("UIScale",{Scale=1},Win)
 local Hdr=new("Frame",{Size=UDim2.new(1,0,0,46),BackgroundColor3=Color3.fromRGB(18,18,25),BorderSizePixel=0},Win)
-new("TextLabel",{Size=UDim2.new(1,-60,1,0),Position=UDim2.new(0,14,0,0),BackgroundTransparency=1,Text="KAKARAI HUB v4.1",TextColor3=RED,TextSize=15,Font=Enum.Font.GothamBold,TextXAlignment=Enum.TextXAlignment.Left},Hdr)
+new("TextLabel",{Size=UDim2.new(1,-60,1,0),Position=UDim2.new(0,14,0,0),BackgroundTransparency=1,Text="KAKARAI HUB v4.2",TextColor3=RED,TextSize=15,Font=Enum.Font.GothamBold,TextXAlignment=Enum.TextXAlignment.Left},Hdr)
 local CloseB=new("TextButton",{Size=UDim2.new(0,34,0,34),Position=UDim2.new(1,-40,0,6),BackgroundColor3=Color3.fromRGB(160,20,20),Text="X",TextColor3=Color3.new(1,1,1),TextSize=14,Font=Enum.Font.GothamBold,BorderSizePixel=0},Hdr)
 corner(CloseB,8)
 CloseB.Activated:Connect(function() Win.Visible=false end)
@@ -490,6 +567,29 @@ makeDraggable(FB,FB,function() Win.Visible=not Win.Visible end)
 makeDraggable(Hdr,Win)
 track(UIS.InputBegan:Connect(function(i,gpe) if not gpe and i.KeyCode==Enum.KeyCode.RightShift then Win.Visible=not Win.Visible end end))
 
+-- alça de redimensionar
+local RS=new("TextButton",{Size=UDim2.new(0,28,0,28),Position=UDim2.new(1,-28,1,-28),BackgroundColor3=RED,BackgroundTransparency=0.3,Text="+",TextColor3=Color3.new(1,1,1),TextSize=18,Font=Enum.Font.GothamBold,BorderSizePixel=0,ZIndex=20},Win)
+corner(RS,8)
+do
+ local rd,rStart,rW,rH=false,nil,0,0
+ RS.InputBegan:Connect(function(i)
+  if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+   rd=true rStart=i.Position rW=Win.Size.X.Offset rH=Win.Size.Y.Offset
+  end
+ end)
+ track(UIS.InputChanged:Connect(function(i)
+  if rd and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+   local sc=math.max(uiScale.Scale,0.1)
+   local d=i.Position-rStart
+   local vs=Cam.ViewportSize
+   Win.Size=UDim2.new(0,math.clamp(rW+d.X/sc,240,math.max(vs.X/sc-20,240)),0,math.clamp(rH+d.Y/sc,240,math.max(vs.Y/sc-20,240)))
+  end
+ end))
+ track(UIS.InputEnded:Connect(function(i)
+  if rd and (i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch) then rd=false end
+ end))
+end
+
 local Tabs,order={},0
 local function nx() order=order+1 return order end
 local function selectTab(n)
@@ -506,12 +606,12 @@ local function selectTab(n)
 end
 
 local function addTab(name)
- local btn=new("TextButton",{Size=UDim2.new(0,70,1,0),BackgroundTransparency=1,Text=name,TextColor3=MUTED,TextSize=11,Font=Enum.Font.GothamBold,LayoutOrder=nx()},TabBar)
+ local btn=new("TextButton",{Size=UDim2.new(0,76,1,0),BackgroundTransparency=1,Text=name,TextColor3=MUTED,TextSize=11,Font=Enum.Font.GothamBold,LayoutOrder=nx()},TabBar)
  local ind=new("Frame",{Size=UDim2.new(0.7,0,0,2),Position=UDim2.new(0.15,0,1,-2),BackgroundColor3=RED,BorderSizePixel=0,Visible=false},btn)
  local page=new("ScrollingFrame",{Size=UDim2.new(1,0,1,-92),Position=UDim2.new(0,0,0,92),BackgroundTransparency=1,BorderSizePixel=0,Active=true,ScrollBarThickness=3,ScrollBarImageColor3=RED,ScrollingDirection=Enum.ScrollingDirection.Y,AutomaticCanvasSize=Enum.AutomaticSize.None,CanvasSize=UDim2.new(0,0,0,0),Visible=false},Win)
- new("UIPadding",{PaddingLeft=UDim.new(0,10),PaddingRight=UDim.new(0,10),PaddingTop=UDim.new(0,6),PaddingBottom=UDim.new(0,24)},page)
+ new("UIPadding",{PaddingLeft=UDim.new(0,10),PaddingRight=UDim.new(0,10),PaddingTop=UDim.new(0,6),PaddingBottom=UDim.new(0,32)},page)
  local lay=new("UIListLayout",{SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,5)},page)
- local function sync() page.CanvasSize=UDim2.new(0,0,0,lay.AbsoluteContentSize.Y+40) end
+ local function sync() page.CanvasSize=UDim2.new(0,0,0,lay.AbsoluteContentSize.Y+48) end
  lay:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(sync)
  Tabs[name]={page=page,btn=btn,ind=ind,sync=sync}
  btn.Activated:Connect(function() selectTab(name) end)
@@ -523,6 +623,12 @@ local function addTab(name)
  function api.Note(t)
   local l=new("TextLabel",{Size=UDim2.new(1,0,0,40),BackgroundColor3=BG1,BorderSizePixel=0,Text=t,TextColor3=MUTED,TextSize=11,Font=Enum.Font.Gotham,TextWrapped=true,LayoutOrder=nx()},page)
   corner(l)
+  return l
+ end
+ function api.Info(t)
+  local l=new("TextLabel",{Size=UDim2.new(1,0,0,54),BackgroundColor3=BG2,BorderSizePixel=0,Text=t,TextColor3=T1,TextSize=12,Font=Enum.Font.GothamBold,TextWrapped=true,LayoutOrder=nx()},page)
+  corner(l)
+  return l
  end
  function api.Toggle(label,tbl,key,cb)
   local r=new("TextButton",{Size=UDim2.new(1,0,0,42),BackgroundColor3=BG1,BorderSizePixel=0,Text="",AutoButtonColor=false,LayoutOrder=nx()},page)
@@ -538,7 +644,9 @@ local function addTab(name)
    knob.Position=on and UDim2.new(1,-19,0.5,-8) or UDim2.new(0,3,0.5,-8)
   end
   paint()
-  r.Activated:Connect(function() tbl[key]=not tbl[key] paint() if cb then pcall(cb,tbl[key]) end end)
+  local function set(v) tbl[key]=v paint() if cb then pcall(cb,v) end end
+  r.Activated:Connect(function() set(not tbl[key]) end)
+  return set
  end
  function api.Slider(label,tbl,key,mn,mx,step,cb)
   step=step or 1
@@ -622,6 +730,19 @@ A.Section("Alvo")
 A.PlayerCycle("Jogador",S.Aim,"Selected")
 A.Toggle("Ignorar time",S.G,"Team")
 
+local RC=addTab("Recuo")
+RC.Section("Compensação de recuo")
+local RecInfo=RC.Info("Arma: Nenhuma\nRecuo: não detectado")
+RC.Toggle("Compensar recuo no aimbot",S.Rec,"On")
+RC.Toggle("Só se detectar recuo (auto)",S.Rec,"Auto")
+RC.Section("Ajustes")
+RC.Slider("Intensidade",S.Rec,"Comp",0,3,0.05)
+RC.Slider("Compensação fixa (graus)",S.Rec,"Fixed",0,5,0.05)
+RC.Slider("Limite máximo (graus)",S.Rec,"MaxDeg",0,12,0.1)
+RC.Slider("Queda por distância (studs/100)",S.Rec,"Drop",0,5,0.05)
+RC.Button("Zerar aprendizado das armas",function() Rec.peak={} Rec.est=0 Rec.det=false end,Color3.fromRGB(120,30,30))
+RC.Note("Atire sem mexer a mira para o sistema medir o recuo da arma. A mira desce mais quanto maior a distância e o recuo.")
+
 local E=addTab("ESP")
 E.Section("ESP")
 E.Toggle("Ativar ESP",S.ESP,"On")
@@ -676,6 +797,10 @@ V.Toggle("Fullbright",S.Vis,"Full",function(v) if not v then restoreLight("full"
 V.Toggle("Sem neblina",S.Vis,"NoFog",function(v) if not v then restoreLight("fog") end end)
 
 local X=addTab("Misc")
+X.Section("Painel")
+X.Slider("Escala do painel",S.UI,"Scale",0.6,1.4,0.05,function(v) uiScale.Scale=v end)
+X.Button("Resetar tamanho do painel",function() Win.Size=UDim2.new(0,defW,0,defH) end,Color3.fromRGB(40,90,160))
+X.Note("Arraste a alça + no canto inferior direito para mudar largura e altura.")
 X.Section("Utilidades")
 X.Toggle("Anti-AFK",S.Misc,"AFK")
 X.Toggle("Mostrar FPS",S.Misc,"FPS")
@@ -683,18 +808,46 @@ X.Button("Rejoin",rejoin,Color3.fromRGB(40,90,160))
 X.Button("Trocar de servidor",serverHop,Color3.fromRGB(40,90,160))
 X.Button("Descarregar script",function() if getgenv and getgenv().KH_Unload then getgenv().KH_Unload() end end,Color3.fromRGB(120,30,30))
 
-local F=addTab("FPS")
-F.Section("Otimização")
-local fpsFlags={Shadow=false,Part=false,FX=false,Decal=false,Light=false,Plastic=false,Sound=false,Low=false}
-F.Toggle("Sem sombras",fpsFlags,"Shadow",function(v) if v then shadowOrig=Lighting.GlobalShadows Lighting.GlobalShadows=false elseif shadowOrig~=nil then Lighting.GlobalShadows=shadowOrig end end)
-F.Toggle("Sem partículas",fpsFlags,"Part",function(v) fpsApply("part",v,{workspace},PART,"Enabled",false) end)
-F.Toggle("Sem efeitos de pós-processamento",fpsFlags,"FX",function(v) fpsApply("fx",v,{Lighting,workspace.CurrentCamera},FX,"Enabled",false) end)
-F.Toggle("Sem decalques/texturas",fpsFlags,"Decal",function(v) fpsApply("decal",v,{workspace},{"Decal","Texture"},"Transparency",1) end)
-F.Toggle("Sem luzes",fpsFlags,"Light",function(v) fpsApply("light",v,{workspace},{"PointLight","SpotLight","SurfaceLight"},"Enabled",false) end)
-F.Toggle("Materiais lisos",fpsFlags,"Plastic",function(v) fpsApply("mat",v,{workspace},{"BasePart"},"Material",Enum.Material.Plastic) end)
-F.Toggle("Mutar sons",fpsFlags,"Sound",function(v) fpsApply("snd",v,{game},{"Sound"},"Volume",0) end)
-F.Toggle("Qualidade gráfica mínima",fpsFlags,"Low",function(v) pcall(function() settings().Rendering.QualityLevel=v and Enum.QualityLevel.Level01 or Enum.QualityLevel.Automatic end) end)
+local F=addTab("FPS Boost")
+local fpsSetters={}
+local function fpsToggle(label,key,cb) fpsSetters[key]=F.Toggle(label,fpsFlags,key,cb) end
+F.Section("Atalhos")
+F.Button("Ativar tudo (modo extremo)",function() for k,s in pairs(fpsSetters) do if not fpsFlags[k] then s(true) end end end)
+F.Button("Desativar tudo",function() for k,s in pairs(fpsSetters) do if fpsFlags[k] then s(false) end end end,Color3.fromRGB(120,30,30))
+F.Button("Limpar memória (GC)",function() pcall(collectgarbage,"collect") pcall(collectgarbage) end,Color3.fromRGB(40,90,160))
+F.Section("Sombras e luz")
+fpsToggle("Sem sombras globais","Shadow",function(v) if v then shadowOrig=Lighting.GlobalShadows Lighting.GlobalShadows=false elseif shadowOrig~=nil then Lighting.GlobalShadows=shadowOrig end end)
+fpsToggle("Sem sombras das peças","CastSh",function(v) fpsApply("cast",v,{workspace},{"BasePart"},"CastShadow",false) end)
+fpsToggle("Sem luzes","Light",function(v) fpsApply("light",v,{workspace},{"PointLight","SpotLight","SurfaceLight"},"Enabled",false) end)
+fpsToggle("Sem pós-processamento","FX",function(v) fpsApply("fx",v,{Lighting,workspace.CurrentCamera},FX,"Enabled",false) end)
+F.Section("Efeitos e texturas")
+fpsToggle("Sem partículas e rastros","Part",function(v) fpsApply("part",v,{workspace},PART,"Enabled",false) end)
+fpsToggle("Sem decalques/texturas","Decal",function(v) fpsApply("decal",v,{workspace},{"Decal","Texture"},"Transparency",1) end)
+fpsToggle("Sem reflexos","Refl",function(v) fpsApply("refl",v,{workspace},{"BasePart"},"Reflectance",0) end)
+fpsToggle("Materiais lisos","Plastic",function(v) fpsApply("mat",v,{workspace},{"BasePart"},"Material",Enum.Material.Plastic) end)
+F.Section("Mundo")
+fpsToggle("Água leve","Water",function(v)
+ local t=workspace:FindFirstChildOfClass("Terrain")
+ if not t then return end
+ if v then
+  waterSave=waterSave or {t.WaterWaveSize,t.WaterWaveSpeed,t.WaterReflectance,t.WaterTransparency}
+  t.WaterWaveSize=0 t.WaterWaveSpeed=0 t.WaterReflectance=0 t.WaterTransparency=0.8
+ elseif waterSave then
+  t.WaterWaveSize=waterSave[1] t.WaterWaveSpeed=waterSave[2] t.WaterReflectance=waterSave[3] t.WaterTransparency=waterSave[4]
+  waterSave=nil
+ end
+end)
+fpsToggle("Sem nuvens e atmosfera","Sky",function(v)
+ fpsApply("cloud",v,{workspace},{"Clouds"},"Enabled",false)
+ fpsApply("atm",v,{Lighting},{"Atmosphere"},"Density",0)
+end)
+F.Section("Sistema")
+fpsToggle("Qualidade gráfica mínima","Low",function(v) pcall(function() settings().Rendering.QualityLevel=v and Enum.QualityLevel.Level01 or Enum.QualityLevel.Automatic end) end)
+fpsToggle("Malhas simples (menos detalhe)","Mesh",function(v) pcall(function() settings().Rendering.MeshPartDetailLevel=v and Enum.MeshPartDetailLevel.Level04 or Enum.MeshPartDetailLevel.DistanceBased end) end)
+fpsToggle("Mutar sons","Sound",function(v) fpsApply("snd",v,{game},{"Sound"},"Volume",0) end)
 F.Cycle("Limite de FPS",S.FPS,"Cap",{"30","60","120","144","240","Ilimitado"},setCap)
+F.Cycle("Taxa de atualização do ESP",S.FPS,"ESPRate",{"Máx","60","30","15"})
+F.Note("ESP em 30 ou 15 atualiza menos vezes por segundo e libera FPS. O aimbot continua a cada frame.")
 
 selectTab("Aimbot")
 
@@ -702,11 +855,16 @@ selectTab("Aimbot")
 local FL=new("TextLabel",{Size=UDim2.new(0,90,0,24),Position=UDim2.new(0.5,-45,0,6),BackgroundColor3=Color3.new(0,0,0),BackgroundTransparency=0.35,BorderSizePixel=0,Text="FPS: --",TextColor3=Color3.fromRGB(0,220,0),TextSize=13,Font=Enum.Font.GothamBold,Visible=false},Root)
 corner(FL,6)
 local frames,acc=0,0
+local lastRef,lastESP=0,0
 
 RunService:BindToRenderStep("KH_Main",Enum.RenderPriority.Camera.Value+1,function(dt)
- refresh()
+ local now=os.clock()
+ local iv=ESPR[S.FPS.ESPRate] or 0
+ if S.Aim.On or iv==0 or now-lastRef>=iv then refresh() lastRef=now end
+ pcall(recoilStep,dt)
  pcall(doAim)
- pcall(updateESP)
+ if iv==0 or now-lastESP>=iv then pcall(updateESP) lastESP=now end
+ pcall(function() Rec.lastPitch=curPitch() end)
  local vs=Cam.ViewportSize
  if fovCircle then fovCircle.Position=vs/2 fovCircle.Radius=S.Aim.FOV fovCircle.Visible=S.Aim.On and S.Aim.ShowFOV end
  if crossH and crossV then
@@ -722,6 +880,8 @@ RunService:BindToRenderStep("KH_Main",Enum.RenderPriority.Camera.Value+1,functio
   FL.Text="FPS: "..f
   FL.TextColor3=f>=60 and Color3.fromRGB(0,220,0) or f>=30 and Color3.fromRGB(220,200,0) or Color3.fromRGB(220,50,50)
   frames,acc=0,0
+  local pk=Rec.peak[Rec.name] or 0
+  RecInfo.Text="Arma: "..Rec.name.."\nRecuo: "..(Rec.det and ("detectado (pico "..string.format("%.1f",pk).."°)") or "não detectado")
  end
 end)
 
@@ -729,14 +889,27 @@ end)
 local function unload()
  pcall(function() RunService:UnbindFromRenderStep("KH_Main") end)
  for _,c in ipairs(Conns) do pcall(function() c:Disconnect() end) end
+ for _,c in ipairs(Rec.tc) do pcall(function() c:Disconnect() end) end
  for p in pairs(HBSaved) do hbRestore(p) end
  for _,h in pairs(Chams) do pcall(function() h:Destroy() end) end
  for _,o in ipairs(AllDraw) do killDraw(o) end
+ for _,st in pairs(FS) do
+  for v,o in pairs(st.vals) do pcall(function() if v.Parent then v[st.prop]=o end end) end
+ end
+ if waterSave then
+  pcall(function()
+   local t=workspace:FindFirstChildOfClass("Terrain")
+   t.WaterWaveSize=waterSave[1] t.WaterWaveSpeed=waterSave[2] t.WaterReflectance=waterSave[3] t.WaterTransparency=waterSave[4]
+  end)
+ end
+ if fpsFlags.Low then pcall(function() settings().Rendering.QualityLevel=Enum.QualityLevel.Automatic end) end
+ if fpsFlags.Mesh then pcall(function() settings().Rendering.MeshPartDetailLevel=Enum.MeshPartDetailLevel.DistanceBased end) end
  local hum=myHum()
  if hum then pcall(function() hum.PlatformStand=false if origJump then hum.JumpPower=origJump end end) end
  restoreLight("full") restoreLight("fog")
+ if shadowOrig~=nil then pcall(function() Lighting.GlobalShadows=shadowOrig end) end
  pcall(function() Root:Destroy() end)
  if getgenv then getgenv().KH_Unload=nil end
 end
 if getgenv then getgenv().KH_Unload=unload end
-print("[KH v4.1] ok - RightShift ou botao KH abre o menu")
+print("[KH v4.2] ok - RightShift ou botao KH abre o menu")
